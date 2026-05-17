@@ -1,8 +1,11 @@
 # transfer
 
+cross-platform file transfer over shared_memory
+
 ## how to use
 
 ```bash
+cargo build --release
 transfer -h
 ```
 
