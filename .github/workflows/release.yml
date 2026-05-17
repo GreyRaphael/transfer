@@ -9,8 +9,15 @@ permissions:
   contents: write # 必须赋予写权限，否则无法创建和上传 Release 产物
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+
   publish:
     name: Publish for ${{ matrix.os }}
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -33,23 +40,17 @@ jobs:
             artifact_name: transfer-windows-amd64.exe
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # 使用 taiki-e 的 action 自动进行 cargo build --release 并上传到 Release
-      - name: Upload artifact to GitHub Release
-        uses: taiki-e/upload-rust-binary-action@v1
+      - uses: taiki-e/upload-rust-binary-action@v1
         with:
           # 需要在 Cargo.toml 的 [package] 中定义的 bin 名字
-          bin: transfer 
+          bin: transfer
           # 最终在 Release 页面显示的文件名
           archive: ${{ matrix.artifact_name }}
           target: ${{ matrix.target }}
           # 自动引用当前的 Tag 创建/追加到 Release 页面
           token: ${{ secrets.GITHUB_TOKEN }}
-          create-release: true # 👈 加上这一行，允许工作流自动创建 Release 页面
