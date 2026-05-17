@@ -32,6 +32,9 @@ transfer r
 ## how to trigger release
 
 ```bash
+# 先push source
+git push
+# 再push tag
 git tag v1.0.0
 git push origin v1.0.0
 ```
