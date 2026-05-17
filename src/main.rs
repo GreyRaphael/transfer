@@ -1,134 +1,108 @@
 use clap::{Parser, Subcommand};
-use shared_memory::{Shmem, ShmemConf};
+use notify::{RecursiveMode, Watcher};
+use shared_memory::ShmemConf;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::channel;
+use std::time::Duration;
 
 // --- 常量配置 ---
-const SHM_ID: &str = "transfer_cli_shm_v1";
-const DATA_SIZE: usize = 16 * 1024 * 1024; // 16MB 的传输块大小
-const STATE_SPACE_READY: u32 = 0; // 内存块空闲，可写
-const STATE_DATA_READY: u32 = 1;  // 内存块有数据，可读
+const SHM_ID: &str = "transfer_cli_sync_v2"; // 换个 ID，避免和之前的冲突
+const DATA_SIZE: usize = 8 * 1024 * 1024;
+const STATE_SPACE_READY: u32 = 0;
+const STATE_DATA_READY: u32 = 1;
 
 // --- 共享内存布局 ---
-// 通过跨进程原子变量实现自旋锁机制
 #[repr(C)]
 struct ShmBlock {
     state: AtomicU32,
+    session_id: AtomicU32, // 新增：版本号/会话ID。用于连续同步
     is_eof: AtomicBool,
     length: AtomicUsize,
     data: [u8; DATA_SIZE],
 }
 
-// ==========================================
-// Writer (发送端) 的实现
-// ==========================================
-struct ShmWriter {
-    shmem: Shmem,
+// 提取一个上下文包装器，方便生成 Reader/Writer 实例
+#[derive(Clone)]
+struct ShmContext {
+    ptr: *mut ShmBlock,
+}
+unsafe impl Send for ShmContext {}
+
+impl ShmContext {
+    fn get(&self) -> &mut ShmBlock {
+        unsafe { &mut *self.ptr }
+    }
 }
 
-impl ShmWriter {
-    fn new() -> Self {
-        // 尝试创建共享内存。如果遇到残留，则直接打开复用（自愈机制）
-        let shmem = match ShmemConf::new()
-            .size(std::mem::size_of::<ShmBlock>())
-            .os_id(SHM_ID)
-            .create()
-        {
-            Ok(shm) => shm,
-            Err(shared_memory::ShmemError::MappingIdExists) => {
-                println!("⚠️  检测到残留的共享内存 (可能是上一次异常退出导致的)。正在强行复用...");
-                ShmemConf::new()
-                    .os_id(SHM_ID)
-                    .open()
-                    .expect("Failed to open existing shared memory")
-            }
-            Err(e) => panic!("Failed to create shared memory: {}", e),
-        };
+// ==========================================
+// 连续写入会话 (Writer Session)
+// ==========================================
+struct ShmWriterSession {
+    ctx: ShmContext,
+}
 
-        // 无论新建还是复用，都必须强制初始化/重置状态机
-        let block = unsafe { &mut *(shmem.as_ptr() as *mut ShmBlock) };
-        block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
-        block.is_eof.store(false, Ordering::SeqCst);
-        block.length.store(0, Ordering::SeqCst);
-
-        Self { shmem }
-    }
-
+impl ShmWriterSession {
     fn finish(self) {
-        let block = unsafe { &mut *(self.shmem.as_ptr() as *mut ShmBlock) };
-        wait_for_state(&block.state, STATE_SPACE_READY);
+        let block = self.ctx.get();
+        wait_for_state(&block.state, STATE_SPACE_READY, None);
         block.is_eof.store(true, Ordering::Release);
         block.state.store(STATE_DATA_READY, Ordering::Release);
-        println!("Transfer complete.");
     }
 }
 
-impl Write for ShmWriter {
+impl Write for ShmWriterSession {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let block = unsafe { &mut *(self.shmem.as_ptr() as *mut ShmBlock) };
-        
-        wait_for_state(&block.state, STATE_SPACE_READY);
+        let block = self.ctx.get();
+        wait_for_state(&block.state, STATE_SPACE_READY, None);
 
-        // 写入数据
         let write_len = std::cmp::min(buf.len(), DATA_SIZE);
         unsafe {
             std::ptr::copy_nonoverlapping(buf.as_ptr(), block.data.as_mut_ptr(), write_len);
         }
 
-        // 更新状态，通知 Reader
         block.length.store(write_len, Ordering::Release);
         block.state.store(STATE_DATA_READY, Ordering::Release);
 
         Ok(write_len)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 // ==========================================
-// Reader (接收端) 的实现
+// 连续读取会话 (Reader Session)
 // ==========================================
-struct ShmReader {
-    shmem: Shmem,
+struct ShmReaderSession {
+    ctx: ShmContext,
+    session_id: u32,
     current_offset: usize,
     current_len: usize,
     first_read: bool,
 }
 
-impl ShmReader {
-    fn new() -> Self {
-        println!("Waiting for writer to initialize shared memory...");
-        // 轮询等待 Writer 创建共享内存
-        let shmem = loop {
-            if let Ok(shm) = ShmemConf::new().os_id(SHM_ID).open() {
-                break shm;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        };
-        println!("Connected to shared memory!");
-        Self { shmem, current_offset: 0, current_len: 0, first_read: true }
-    }
-}
-
-impl Read for ShmReader {
+impl Read for ShmReaderSession {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let block = unsafe { &mut *(self.shmem.as_ptr() as *mut ShmBlock) };
+        let block = self.ctx.get();
 
-        // 如果当前块的数据已经读完，则等待新数据
         if self.current_offset == self.current_len {
             if !self.first_read {
-                // 释放空间，通知 Writer 继续写
                 block.state.store(STATE_SPACE_READY, Ordering::Release);
             }
             self.first_read = false;
 
-            wait_for_state(&block.state, STATE_DATA_READY);
+            // 监听数据，同时监控 session_id
+            // 如果在读取中途，Writer被杀掉并重启(session变大)，直接报错打断当前 Tar 解压
+            if !wait_for_state(&block.state, STATE_DATA_READY, Some(self.session_id)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "Writer restarted mid-stream",
+                ));
+            }
 
             if block.is_eof.load(Ordering::Acquire) {
-                return Ok(0); // 接收到 EOF
+                return Ok(0);
             }
 
             self.current_len = block.length.load(Ordering::Acquire);
@@ -145,16 +119,25 @@ impl Read for ShmReader {
                 read_len,
             );
         }
-
         self.current_offset += read_len;
         Ok(read_len)
     }
 }
 
-// 辅助函数：带退避机制的自旋等待（避免占满 CPU）
-fn wait_for_state(state: &AtomicU32, expected: u32) {
+// 辅助函数：带中断机制的自旋。返回 false 表示发现 session 更新（发生了中断）
+fn wait_for_state(state: &AtomicU32, expected: u32, check_session: Option<u32>) -> bool {
     let mut spins = 0;
     while state.load(Ordering::Acquire) != expected {
+        if let Some(expected_session) = check_session {
+            // 这是一段极其精妙的逻辑：防止 Writer 崩溃重启时 Reader 卡死
+            // 如果在等待期间，发现会话 ID 变了，说明 Writer 重启开启了新的一轮
+            let block_ptr = (state as *const AtomicU32 as usize - std::mem::offset_of!(ShmBlock, state)) as *mut ShmBlock;
+            let current_session = unsafe { (*block_ptr).session_id.load(Ordering::Acquire) };
+            if current_session != expected_session {
+                return false; 
+            }
+        }
+
         if spins < 1000 {
             std::hint::spin_loop();
         } else {
@@ -162,14 +145,14 @@ fn wait_for_state(state: &AtomicU32, expected: u32) {
         }
         spins += 1;
     }
+    true
 }
-
 
 // ==========================================
 // 命令行界面 (CLI)
 // ==========================================
 #[derive(Parser)]
-#[command(name = "transfer", about = "Transfer files via Shared Memory")]
+#[command(name = "transfer", about = "Continuous Directory Sync via Shared Memory")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -177,53 +160,135 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Writer mode
-    W {
+    SyncW {
         #[arg(short, long)]
         input: String,
     },
-    /// Reader mode
-    R,
+    SyncR,
 }
 
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::W { input } => {
+        Commands::SyncW { input } => {
             let path = Path::new(&input);
-            if !path.exists() {
-                eprintln!("Error: Path '{}' does not exist.", input);
+            if !path.is_dir() {
+                eprintln!("Error: Path '{}' is not a directory.", input);
                 return;
             }
 
-            println!("Initializing transfer for: {:?}", path);
-            let shm_writer = ShmWriter::new();
-            let mut builder = tar::Builder::new(shm_writer);
+            // 初始化/恢复共享内存
+            let shmem = match ShmemConf::new().size(std::mem::size_of::<ShmBlock>()).os_id(SHM_ID).create() {
+                Ok(shm) => shm,
+                Err(shared_memory::ShmemError::MappingIdExists) => {
+                    println!("⚠️ 复用已存在的共享内存通道...");
+                    ShmemConf::new().os_id(SHM_ID).open().unwrap()
+                }
+                Err(e) => panic!("Init failed: {}", e),
+            };
 
-            if path.is_dir() {
-                // 动态打包目录并写入共享内存
-                builder.append_dir_all(path.file_name().unwrap(), path).unwrap();
-            } else {
-                // 动态打包单文件并写入共享内存
-                let mut file = std::fs::File::open(path).unwrap();
-                builder.append_file(path.file_name().unwrap(), &mut file).unwrap();
-            }
-
-            // 完成 Tar 构建并获取回内部的 writer 来发送 EOF
-            let shm_writer = builder.into_inner().unwrap();
-            shm_writer.finish();
-        }
-        Commands::R => {
-            let shm_reader = ShmReader::new();
-            let mut archive = tar::Archive::new(shm_reader);
+            let ctx = ShmContext { ptr: shmem.as_ptr() as *mut ShmBlock };
+            let block = ctx.get();
             
-            println!("Unpacking data...");
-            // 将接受到的 Tar 流解压到当前目录 "."
-            if let Err(e) = archive.unpack(".") {
-                eprintln!("Failed to unpack: {}", e);
-            } else {
-                println!("Data received and unpacked successfully!");
+            // Writer 每次启动，获取旧的 session_id 并 +1，通知 Reader 这是全新的一局
+            let mut current_session = block.session_id.load(Ordering::SeqCst) + 1;
+            
+            // 初始化/清理内存状态
+            block.session_id.store(current_session, Ordering::SeqCst);
+            block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
+            block.is_eof.store(false, Ordering::SeqCst);
+
+            // 设置监听器
+            let (tx, rx) = channel();
+            let mut watcher = notify::recommended_watcher(tx).unwrap();
+            watcher.watch(path, RecursiveMode::Recursive).unwrap();
+
+            println!("👀 正在监控目录: {:?}", path);
+            println!("🔄 执行首次全量同步...");
+            
+            // 定义一个执行打包并发送的闭包
+            let perform_sync = |session: u32| {
+                block.session_id.store(session, Ordering::SeqCst);
+                block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
+                block.is_eof.store(false, Ordering::SeqCst);
+
+                let writer = ShmWriterSession { ctx: ctx.clone() };
+                let mut builder = tar::Builder::new(writer);
+                if let Err(e) = builder.append_dir_all(".", path) {
+                    eprintln!("打包错误: {}", e);
+                }
+                builder.into_inner().unwrap().finish();
+                println!("✅ 同步完成 (Session {})", session);
+            };
+
+            perform_sync(current_session);
+
+            // 主循环：处理文件系统事件
+            loop {
+                match rx.recv() {
+                    Ok(Ok(_)) => {
+                        // 【防抖机制 Debounce】: 
+                        // 发生改变后，等待 300ms，并把这期间积压的其他事件全部吞掉
+                        // 防止保存一个文件触发 5 次同步
+                        std::thread::sleep(Duration::from_millis(300));
+                        while let Ok(_) = rx.try_recv() {} 
+
+                        current_session += 1;
+                        println!("📝 检测到文件修改，启动同步 (Session {})...", current_session);
+                        perform_sync(current_session);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Commands::SyncR => {
+            println!("⏳ 等待 Writer 建立共享内存...");
+            let shmem = loop {
+                if let Ok(shm) = ShmemConf::new().os_id(SHM_ID).open() {
+                    break shm;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            
+            let ctx = ShmContext { ptr: shmem.as_ptr() as *mut ShmBlock };
+            println!("🔗 已连接! 等待接收同步流...");
+
+            let mut last_processed_session = 0;
+
+            loop {
+                let block = ctx.get();
+                let current_session = block.session_id.load(Ordering::Acquire);
+                
+                // 轮询等待新的 session 开启
+                if current_session > last_processed_session {
+                    println!("📥 开始接收新版本 (Session {})...", current_session);
+                    
+                    let reader = ShmReaderSession { 
+                        ctx: ctx.clone(), 
+                        session_id: current_session,
+                        current_offset: 0, 
+                        current_len: 0, 
+                        first_read: true 
+                    };
+                    
+                    let mut archive = tar::Archive::new(reader);
+                    
+                    match archive.unpack(".") {
+                        Ok(_) => {
+                            println!("✨ 目录更新完毕! (Session {})", current_session);
+                            last_processed_session = current_session;
+                        }
+                        Err(e) => {
+                            // 如果是中途 Writer 退出导致的异常，会走到这里并重试
+                            eprintln!("⚠️ 解包被中断或发生错误: {}。等待下一次同步...", e);
+                            last_processed_session = current_session - 1; // 标记失败，强制重试
+                        }
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
     }
