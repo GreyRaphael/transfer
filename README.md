@@ -9,7 +9,7 @@ cargo build --release
 transfer -h
 ```
 
-transfer a single file
+> transfer a single file
 
 ```bash
 # step1, run writer
@@ -19,8 +19,7 @@ transfer w -i /path/to/your/file
 transfer r
 ```
 
-
-transfer a whole directory
+> transfer a whole directory
 
 ```bash
 # step1, run writer
