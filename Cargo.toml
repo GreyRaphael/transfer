@@ -1,0 +1,9 @@
+[package]
+name = "transfer"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+clap = {version="4.6", features = ["derive"]}
+shared_memory = "0.12"
+tar = "0.4"
