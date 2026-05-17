@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 // --- 常量配置 ---
 const SHM_ID: &str = "transfer_cli_shm_v1";
-const DATA_SIZE: usize = 8 * 1024 * 1024; // 8MB 的传输块大小
+const DATA_SIZE: usize = 16 * 1024 * 1024; // 16MB 的传输块大小
 const STATE_SPACE_READY: u32 = 0; // 内存块空闲，可写
 const STATE_DATA_READY: u32 = 1;  // 内存块有数据，可读
 
