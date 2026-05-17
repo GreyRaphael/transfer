@@ -9,7 +9,7 @@ use std::time::Duration;
 
 // --- 常量配置 ---
 // 更新了 SHM_ID 防止和上次运行的死锁内存冲突
-const SHM_ID: &str = "transfer_cli_sync_v3"; 
+const SHM_ID: &str = "transfer_cli_sync_v3";
 const DATA_SIZE: usize = 8 * 1024 * 1024;
 const STATE_SPACE_READY: u32 = 0;
 const STATE_DATA_READY: u32 = 1;
@@ -26,11 +26,15 @@ struct ShmBlock {
 }
 
 #[derive(Clone)]
-struct ShmContext { ptr: *mut ShmBlock }
+struct ShmContext {
+    ptr: *mut ShmBlock,
+}
 unsafe impl Send for ShmContext {}
 
 impl ShmContext {
-    fn get(&self) -> &mut ShmBlock { unsafe { &mut *self.ptr } }
+    fn get(&self) -> &mut ShmBlock {
+        unsafe { &mut *self.ptr }
+    }
 }
 
 // ==========================================
@@ -46,8 +50,14 @@ impl ShmWriterSession {
         let mut spins = 0;
         // 等待 Reader 腾出空间，如果发现 Reader 已经崩溃/放弃，则直接停止发送 EOF
         while block.state.load(Ordering::Acquire) != STATE_SPACE_READY {
-            if block.reader_aborted.load(Ordering::Acquire) { return; }
-            if spins < 1000 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+            if block.reader_aborted.load(Ordering::Acquire) {
+                return;
+            }
+            if spins < 1000 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
             spins += 1;
         }
         block.is_eof.store(true, Ordering::Release);
@@ -58,14 +68,21 @@ impl ShmWriterSession {
 impl Write for ShmWriterSession {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let block = self.ctx.get();
-        
+
         let mut spins = 0;
         while block.state.load(Ordering::Acquire) != STATE_SPACE_READY {
             // 防死锁核心：如果 Reader 解包出错主动退出，Writer 立刻感知并抛出 Error 打断 Tar
             if block.reader_aborted.load(Ordering::Acquire) {
-                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Reader aborted"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "Reader aborted",
+                ));
             }
-            if spins < 1000 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+            if spins < 1000 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
             spins += 1;
         }
 
@@ -79,7 +96,9 @@ impl Write for ShmWriterSession {
         Ok(write_len)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // ==========================================
@@ -108,9 +127,16 @@ impl Read for ShmReaderSession {
             while block.state.load(Ordering::Acquire) != STATE_DATA_READY {
                 // 如果 Writer 发生了重启开启了新局，Reader 直接抛错截断当前解压
                 if block.session_id.load(Ordering::Acquire) != self.session_id {
-                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Writer restarted mid-stream"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "Writer restarted mid-stream",
+                    ));
                 }
-                if spins < 1000 { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+                if spins < 1000 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
                 spins += 1;
             }
 
@@ -159,7 +185,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    SyncW { #[arg(short, long)] input: String },
+    SyncW {
+        #[arg(short, long)]
+        input: String,
+    },
     SyncR,
 }
 
@@ -169,23 +198,31 @@ fn main() {
     match cli.command {
         Commands::SyncW { input } => {
             let path = Path::new(&input);
-            
-            let shmem = match ShmemConf::new().size(std::mem::size_of::<ShmBlock>()).os_id(SHM_ID).create() {
+
+            let shmem = match ShmemConf::new()
+                .size(std::mem::size_of::<ShmBlock>())
+                .os_id(SHM_ID)
+                .create()
+            {
                 Ok(shm) => shm,
-                Err(shared_memory::ShmemError::MappingIdExists) => ShmemConf::new().os_id(SHM_ID).open().unwrap(),
+                Err(shared_memory::ShmemError::MappingIdExists) => {
+                    ShmemConf::new().os_id(SHM_ID).open().unwrap()
+                }
                 Err(e) => panic!("Init failed: {}", e),
             };
 
-            let ctx = ShmContext { ptr: shmem.as_ptr() as *mut ShmBlock };
+            let ctx = ShmContext {
+                ptr: shmem.as_ptr() as *mut ShmBlock,
+            };
             let block = ctx.get();
             let mut current_session = block.session_id.load(Ordering::SeqCst) + 1;
-            
+
             let (tx, rx) = channel();
             let mut watcher = notify::recommended_watcher(tx).unwrap();
             watcher.watch(path, RecursiveMode::Recursive).unwrap();
 
             println!("👀 正在监控目录: {:?}", path);
-            
+
             let perform_sync = |session: u32| {
                 // 新一轮同步开始时，重置所有状态
                 block.session_id.store(session, Ordering::SeqCst);
@@ -211,7 +248,10 @@ fn main() {
                         while let Ok(_) = rx.try_recv() {} // 抽干防抖
 
                         current_session += 1;
-                        println!("📝 检测到文件修改，启动自动推送 (Session {})...", current_session);
+                        println!(
+                            "📝 检测到文件修改，启动自动推送 (Session {})...",
+                            current_session
+                        );
                         perform_sync(current_session);
                     }
                     Ok(Err(e)) => eprintln!("Watcher 错误: {:?}", e),
@@ -223,11 +263,15 @@ fn main() {
         Commands::SyncR => {
             println!("⏳ 等待 Writer 建立共享内存...");
             let shmem = loop {
-                if let Ok(shm) = ShmemConf::new().os_id(SHM_ID).open() { break shm; }
+                if let Ok(shm) = ShmemConf::new().os_id(SHM_ID).open() {
+                    break shm;
+                }
                 std::thread::sleep(Duration::from_millis(100));
             };
-            
-            let ctx = ShmContext { ptr: shmem.as_ptr() as *mut ShmBlock };
+
+            let ctx = ShmContext {
+                ptr: shmem.as_ptr() as *mut ShmBlock,
+            };
             println!("🔗 已连接! 开启后台守护流同步...");
 
             let mut last_processed_session = 0;
@@ -235,23 +279,25 @@ fn main() {
             loop {
                 let block = ctx.get();
                 let current_session = block.session_id.load(Ordering::Acquire);
-                
+
                 if current_session > last_processed_session {
                     println!("📥 开始接收新版本 (Session {})...", current_session);
-                    
-                    let reader = ShmReaderSession { 
-                        ctx: ctx.clone(), 
+
+                    let reader = ShmReaderSession {
+                        ctx: ctx.clone(),
                         session_id: current_session,
-                        current_offset: 0, 
-                        current_len: 0, 
+                        current_offset: 0,
+                        current_len: 0,
                         first_read: true,
                         eof_reached: false,
                     };
-                    
+
                     let mut archive = tar::Archive::new(reader);
                     match archive.unpack(".") {
                         Ok(_) => println!("✨ 目录更新完毕! (Session {})", current_session),
-                        Err(e) => eprintln!("⚠️ 解包发生错误: {}。丢弃当前版本，等待下次文件变动...", e),
+                        Err(e) => {
+                            eprintln!("⚠️ 解包发生错误: {}。丢弃当前版本，等待下次文件变动...", e)
+                        }
                     }
                     // 修复死锁：不管成功失败，绝不回退重试当前卡死的 Session
                     last_processed_session = current_session;

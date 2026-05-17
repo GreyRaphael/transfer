@@ -449,6 +449,7 @@ dependencies = [
  "notify",
  "shared_memory",
  "tar",
+ "walkdir",
 ]
 
 [[package]]
