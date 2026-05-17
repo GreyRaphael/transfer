@@ -52,3 +52,4 @@ jobs:
           target: ${{ matrix.target }}
           # 自动引用当前的 Tag 创建/追加到 Release 页面
           token: ${{ secrets.GITHUB_TOKEN }}
+          create-release: true # 👈 加上这一行，允许工作流自动创建 Release 页面
