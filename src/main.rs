@@ -47,11 +47,7 @@ fn collect_snapshot(root: &Path) -> io::Result<HashSet<PathBuf>> {
     for entry in WalkDir::new(root).min_depth(1).follow_links(false) {
         let entry = entry.map_err(io::Error::other)?;
 
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .map_err(io::Error::other)?
-            .to_path_buf();
+        let rel = entry.path().strip_prefix(root).map_err(io::Error::other)?.to_path_buf();
 
         out.insert(rel);
     }
@@ -99,10 +95,7 @@ impl ShmWriterSession {
         // 等待 Reader 腾出空间，如果发现 Reader 已经崩溃/放弃，则直接停止发送 EOF
         while block.state.load(Ordering::Acquire) != STATE_SPACE_READY {
             if block.reader_aborted.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "Reader aborted",
-                ));
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Reader aborted"));
             }
 
             if spins < 1000 {
@@ -188,10 +181,7 @@ impl Read for ShmReaderSession {
             while block.state.load(Ordering::Acquire) != STATE_DATA_READY {
                 // 如果 Writer 发生了重启开启了新局，Reader 直接抛错截断当前解压
                 if block.session_id.load(Ordering::Acquire) != self.session_id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "Writer restarted mid-stream",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Writer restarted mid-stream"));
                 }
 
                 if spins < 1000 {
@@ -215,11 +205,7 @@ impl Read for ShmReaderSession {
         let read_len = buf.len().min(available);
 
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                block.data.as_ptr().add(self.current_offset),
-                buf.as_mut_ptr(),
-                read_len,
-            );
+            std::ptr::copy_nonoverlapping(block.data.as_ptr().add(self.current_offset), buf.as_mut_ptr(), read_len);
         }
 
         self.current_offset += read_len;
@@ -247,10 +233,7 @@ impl SyncReaderSession {
         inner.read_exact(&mut magic)?;
 
         if magic != PROTO_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid protocol magic",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid protocol magic"));
         }
 
         let mut count_bytes = [0u8; 4];
@@ -268,8 +251,7 @@ impl SyncReaderSession {
             let mut path_bytes = vec![0u8; len];
             inner.read_exact(&mut path_bytes)?;
 
-            let rel = String::from_utf8(path_bytes)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "utf8 error"))?;
+            let rel = String::from_utf8(path_bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "utf8 error"))?;
 
             deletions.push(PathBuf::from(rel));
         }
@@ -295,7 +277,7 @@ impl Read for SyncReaderSession {
 }
 
 #[derive(Parser)]
-#[command(name = "transfer")]
+#[command(name = "transfer",author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -317,15 +299,9 @@ fn main() {
         Commands::SyncW { input } => {
             let path = Path::new(&input);
 
-            let shmem = match ShmemConf::new()
-                .size(std::mem::size_of::<ShmBlock>())
-                .os_id(SHM_ID)
-                .create()
-            {
+            let shmem = match ShmemConf::new().size(std::mem::size_of::<ShmBlock>()).os_id(SHM_ID).create() {
                 Ok(shm) => shm,
-                Err(shared_memory::ShmemError::MappingIdExists) => {
-                    ShmemConf::new().os_id(SHM_ID).open().unwrap()
-                }
+                Err(shared_memory::ShmemError::MappingIdExists) => ShmemConf::new().os_id(SHM_ID).open().unwrap(),
                 Err(e) => panic!("Init failed: {}", e),
             };
 
@@ -352,10 +328,7 @@ fn main() {
                     }
                 };
 
-                let mut deleted: Vec<PathBuf> = last_snapshot
-                    .difference(&current_snapshot)
-                    .cloned()
-                    .collect();
+                let mut deleted: Vec<PathBuf> = last_snapshot.difference(&current_snapshot).cloned().collect();
 
                 deleted.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
 
@@ -396,10 +369,7 @@ fn main() {
 
                         current_session += 1;
 
-                        println!(
-                            "📝 检测到文件修改，启动自动推送 (Session {})...",
-                            current_session
-                        );
+                        println!("📝 检测到文件修改，启动自动推送 (Session {})...", current_session);
 
                         perform_sync(current_session, &mut last_snapshot);
                     }
