@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 
 // --- 常量配置 ---
 // 更新了 SHM_ID 防止和上次运行的死锁内存冲突
-const SHM_ID: &str = "transfer_cli_sync_v6";
+const SHM_ID: &str = "transfer_cli_sync_v9";
 const DATA_SIZE: usize = 8 * 1024 * 1024;
 const STATE_SPACE_READY: u32 = 0;
 const STATE_DATA_READY: u32 = 1;
@@ -26,6 +26,7 @@ struct ShmBlock {
     is_eof: AtomicBool,
     reader_aborted: AtomicBool, // 新增：用于防死锁的异常中止信号
     reader_ready: AtomicBool,   // Reader 已连接并进入主循环
+    writer_ready: AtomicBool,   // Writer 已初始化完毕
     length: AtomicUsize,
     data: [u8; DATA_SIZE],
 }
@@ -312,7 +313,20 @@ fn main() {
                 ptr: shmem.as_ptr() as *mut ShmBlock,
             };
             let block = ctx.get();
-            let mut current_session = block.session_id.load(Ordering::SeqCst) + 1;
+
+            // 清理旧状态，确保干净的初始环境
+            block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
+            block.session_id.store(0, Ordering::SeqCst);
+            block.is_eof.store(false, Ordering::SeqCst);
+            block.reader_aborted.store(false, Ordering::SeqCst);
+            block.reader_ready.store(false, Ordering::SeqCst);
+            block.writer_ready.store(false, Ordering::SeqCst);
+            block.length.store(0, Ordering::SeqCst);
+
+            // 标记 Writer 已就绪
+            block.writer_ready.store(true, Ordering::SeqCst);
+
+            let mut current_session = 1;
 
             let mut last_snapshot = collect_snapshot(path).unwrap_or_default();
 
@@ -323,8 +337,9 @@ fn main() {
             println!("👀 正在监控目录: {:?}", path);
 
             let perform_sync = |session: u32, last_snapshot: &mut HashSet<PathBuf>| {
-                if !block.reader_ready.load(Ordering::Acquire) {
-                    return;
+                // 阻塞等待 Reader 连接，避免初始同步被跳过导致死锁
+                while !block.reader_ready.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
 
                 let current_snapshot = match collect_snapshot(path) {
@@ -341,10 +356,11 @@ fn main() {
 
                 let delete_header = encode_deletions(&deleted);
 
-                block.session_id.store(session, Ordering::SeqCst);
                 block.reader_aborted.store(false, Ordering::SeqCst);
-                block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
                 block.is_eof.store(false, Ordering::SeqCst);
+                block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
+                // session_id 必须最后设置，防止 Reader 看到新 session 但读到旧状态
+                block.session_id.store(session, Ordering::SeqCst);
 
                 let writer = ShmWriterSession {
                     ctx: ctx.clone(),
@@ -396,16 +412,26 @@ fn main() {
         Commands::SyncR => {
             println!("⏳ 等待 Writer 建立共享内存...");
             let shmem = loop {
-                if let Ok(shm) = ShmemConf::new().os_id(SHM_ID).open() {
-                    break shm;
+                match ShmemConf::new().os_id(SHM_ID).open() {
+                    Ok(shm) => break shm,
+                    Err(e) => {
+                        eprintln!("  打开共享内存失败: {:?}, 重试中...", e);
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(100));
             };
 
             let ctx = ShmContext {
                 ptr: shmem.as_ptr() as *mut ShmBlock,
             };
-            println!("🔗 已连接! 开启后台守护流同步...");
+            println!("🔗 已连接! 等待 Writer 就绪...");
+
+            // 等待 Writer 初始化完毕
+            while !ctx.get().writer_ready.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            println!("✅ Writer 已就绪，开始同步!");
             ctx.get().reader_ready.store(true, Ordering::Release);
 
             let mut last_processed_session = 0;
