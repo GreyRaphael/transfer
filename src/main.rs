@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use notify::{RecursiveMode, Watcher};
-use shared_memory::ShmemConf;
+use shared_memory::{Shmem, ShmemConf};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -17,6 +17,8 @@ const DATA_SIZE: usize = 8 * 1024 * 1024;
 const STATE_SPACE_READY: u32 = 0;
 const STATE_DATA_READY: u32 = 1;
 const PROTO_MAGIC: [u8; 4] = *b"TRF1";
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
 
 // --- 共享内存布局 ---
 #[repr(C)]
@@ -34,6 +36,11 @@ struct ShmBlock {
     data: [u8; DATA_SIZE],
 }
 
+struct WriterHandshake {
+    generation: u32,
+    next_session: u32,
+}
+
 #[derive(Clone)]
 struct ShmContext {
     ptr: *mut ShmBlock,
@@ -48,13 +55,148 @@ impl ShmContext {
     }
 }
 
+impl ShmBlock {
+    fn reset_for_writer(&self) -> WriterHandshake {
+        let previous_session = self.session_id.load(Ordering::SeqCst);
+        let generation = next_nonzero(self.writer_generation.load(Ordering::SeqCst));
+        let heartbeat = next_nonzero(self.writer_heartbeat.load(Ordering::SeqCst));
+
+        self.state.store(STATE_SPACE_READY, Ordering::SeqCst);
+        self.is_eof.store(false, Ordering::SeqCst);
+        self.reader_aborted.store(false, Ordering::SeqCst);
+        self.reader_ready.store(false, Ordering::SeqCst);
+        self.writer_ready.store(false, Ordering::SeqCst);
+        self.reader_generation.store(0, Ordering::SeqCst);
+        self.length.store(0, Ordering::SeqCst);
+
+        self.writer_generation.store(generation, Ordering::SeqCst);
+        self.writer_heartbeat.store(heartbeat, Ordering::SeqCst);
+        self.writer_ready.store(true, Ordering::SeqCst);
+
+        WriterHandshake {
+            generation,
+            next_session: next_nonzero(previous_session),
+        }
+    }
+
+    fn prepare_session(&self, session: u32) {
+        self.reader_aborted.store(false, Ordering::SeqCst);
+        self.is_eof.store(false, Ordering::SeqCst);
+        self.state.store(STATE_SPACE_READY, Ordering::SeqCst);
+        // session_id 必须最后设置，防止 Reader 看到新 session 但读到旧状态
+        self.session_id.store(session, Ordering::SeqCst);
+    }
+
+    fn reader_attached_to(&self, generation: u32) -> bool {
+        self.reader_ready.load(Ordering::Acquire)
+            && self.reader_generation.load(Ordering::Acquire) == generation
+    }
+
+    fn wait_for_reader(&self, generation: u32) {
+        while !self.reader_attached_to(generation) {
+            self.writer_heartbeat.fetch_add(1, Ordering::Release);
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn attach_reader(&self, generation: u32) {
+        self.reader_generation.store(generation, Ordering::Release);
+        self.reader_ready.store(true, Ordering::Release);
+    }
+}
+
+struct ReaderHandshake {
+    observed_heartbeat: u32,
+    active_generation: u32,
+    last_processed_session: u32,
+}
+
+impl ReaderHandshake {
+    fn new(block: &ShmBlock) -> Self {
+        Self {
+            observed_heartbeat: block.writer_heartbeat.load(Ordering::Acquire),
+            active_generation: 0,
+            last_processed_session: 0,
+        }
+    }
+
+    fn poll_writer(&mut self, block: &ShmBlock) -> bool {
+        let generation = block.writer_generation.load(Ordering::Acquire);
+        let heartbeat = block.writer_heartbeat.load(Ordering::Acquire);
+        let is_new_live_writer = block.writer_ready.load(Ordering::Acquire)
+            && generation != 0
+            && generation != self.active_generation
+            && heartbeat != self.observed_heartbeat;
+
+        if heartbeat != self.observed_heartbeat {
+            self.observed_heartbeat = heartbeat;
+        }
+
+        if !is_new_live_writer {
+            return false;
+        }
+
+        self.active_generation = generation;
+        self.last_processed_session = block.session_id.load(Ordering::Acquire);
+        block.attach_reader(generation);
+        true
+    }
+
+    fn is_connected(&self) -> bool {
+        self.active_generation != 0
+    }
+}
+
+fn next_nonzero(value: u32) -> u32 {
+    value.wrapping_add(1).max(1)
+}
+
+fn create_or_open_writer_mapping() -> Shmem {
+    match ShmemConf::new()
+        .size(std::mem::size_of::<ShmBlock>())
+        .os_id(SHM_ID)
+        .create()
+    {
+        Ok(shm) => shm,
+        Err(shared_memory::ShmemError::MappingIdExists) => {
+            ShmemConf::new().os_id(SHM_ID).open().unwrap()
+        }
+        Err(e) => panic!("Init failed: {}", e),
+    }
+}
+
+fn wait_for_writer_mapping() -> Shmem {
+    loop {
+        match ShmemConf::new().os_id(SHM_ID).open() {
+            Ok(shm) => break shm,
+            Err(e) => {
+                eprintln!("  打开共享内存失败: {:?}, 重试中...", e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn spin_or_yield(spins: &mut usize) {
+    if *spins < 1000 {
+        std::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
+    }
+    *spins += 1;
+}
+
 fn collect_snapshot(root: &Path) -> io::Result<HashSet<PathBuf>> {
     let mut out = HashSet::new();
 
     for entry in WalkDir::new(root).min_depth(1).follow_links(false) {
         let entry = entry.map_err(io::Error::other)?;
 
-        let rel = entry.path().strip_prefix(root).map_err(io::Error::other)?.to_path_buf();
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(io::Error::other)?
+            .to_path_buf();
 
         out.insert(rel);
     }
@@ -95,24 +237,28 @@ struct ShmWriterSession {
 }
 
 impl ShmWriterSession {
-    fn send_bytes(&mut self, bytes: &[u8]) -> io::Result<usize> {
+    fn wait_for_space(&self) -> io::Result<()> {
         let block = self.ctx.get();
-
         let mut spins = 0;
-        // 等待 Reader 腾出空间，如果发现 Reader 已经崩溃/放弃，则直接停止发送 EOF
+
         while block.state.load(Ordering::Acquire) != STATE_SPACE_READY {
             if block.reader_aborted.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Reader aborted"));
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Reader aborted",
+                ));
             }
 
-            if spins < 1000 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-            spins += 1;
+            spin_or_yield(&mut spins);
         }
 
+        Ok(())
+    }
+
+    fn send_bytes(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.wait_for_space()?;
+
+        let block = self.ctx.get();
         let write_len = bytes.len().min(DATA_SIZE);
 
         unsafe {
@@ -126,23 +272,11 @@ impl ShmWriterSession {
     }
 
     fn finish(self) {
-        let block = self.ctx.get();
-
-        let mut spins = 0;
-        while block.state.load(Ordering::Acquire) != STATE_SPACE_READY {
-            // 防死锁核心：如果 Reader 解包出错主动退出，Writer 立刻感知并抛出 Error 打断 Tar
-            if block.reader_aborted.load(Ordering::Acquire) {
-                return;
-            }
-
-            if spins < 1000 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-            spins += 1;
+        if self.wait_for_space().is_err() {
+            return;
         }
 
+        let block = self.ctx.get();
         block.is_eof.store(true, Ordering::Release);
         block.state.store(STATE_DATA_READY, Ordering::Release);
     }
@@ -173,6 +307,37 @@ struct ShmReaderSession {
     eof_reached: bool, // 记录是否正常读取完毕
 }
 
+impl ShmReaderSession {
+    fn new(ctx: ShmContext, session_id: u32) -> Self {
+        Self {
+            ctx,
+            session_id,
+            current_offset: 0,
+            current_len: 0,
+            first_read: true,
+            eof_reached: false,
+        }
+    }
+
+    fn wait_for_data(&self, block: &ShmBlock) -> io::Result<()> {
+        let mut spins = 0;
+
+        while block.state.load(Ordering::Acquire) != STATE_DATA_READY {
+            // 如果 Writer 发生了重启开启了新局，Reader 直接抛错截断当前解压
+            if block.session_id.load(Ordering::Acquire) != self.session_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Writer restarted mid-stream",
+                ));
+            }
+
+            spin_or_yield(&mut spins);
+        }
+
+        Ok(())
+    }
+}
+
 impl Read for ShmReaderSession {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let block = self.ctx.get();
@@ -184,20 +349,7 @@ impl Read for ShmReaderSession {
 
             self.first_read = false;
 
-            let mut spins = 0;
-            while block.state.load(Ordering::Acquire) != STATE_DATA_READY {
-                // 如果 Writer 发生了重启开启了新局，Reader 直接抛错截断当前解压
-                if block.session_id.load(Ordering::Acquire) != self.session_id {
-                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Writer restarted mid-stream"));
-                }
-
-                if spins < 1000 {
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-                spins += 1;
-            }
+            self.wait_for_data(block)?;
 
             if block.is_eof.load(Ordering::Acquire) {
                 self.eof_reached = true;
@@ -212,7 +364,11 @@ impl Read for ShmReaderSession {
         let read_len = buf.len().min(available);
 
         unsafe {
-            std::ptr::copy_nonoverlapping(block.data.as_ptr().add(self.current_offset), buf.as_mut_ptr(), read_len);
+            std::ptr::copy_nonoverlapping(
+                block.data.as_ptr().add(self.current_offset),
+                buf.as_mut_ptr(),
+                read_len,
+            );
         }
 
         self.current_offset += read_len;
@@ -240,7 +396,10 @@ impl SyncReaderSession {
         inner.read_exact(&mut magic)?;
 
         if magic != PROTO_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid protocol magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid protocol magic",
+            ));
         }
 
         let mut count_bytes = [0u8; 4];
@@ -258,7 +417,8 @@ impl SyncReaderSession {
             let mut path_bytes = vec![0u8; len];
             inner.read_exact(&mut path_bytes)?;
 
-            let rel = String::from_utf8(path_bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "utf8 error"))?;
+            let rel = String::from_utf8(path_bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "utf8 error"))?;
 
             deletions.push(PathBuf::from(rel));
         }
@@ -306,35 +466,13 @@ fn main() {
         Commands::SyncW { input } => {
             let path = Path::new(&input);
 
-            let shmem = match ShmemConf::new().size(std::mem::size_of::<ShmBlock>()).os_id(SHM_ID).create() {
-                Ok(shm) => shm,
-                Err(shared_memory::ShmemError::MappingIdExists) => ShmemConf::new().os_id(SHM_ID).open().unwrap(),
-                Err(e) => panic!("Init failed: {}", e),
-            };
-
+            let shmem = create_or_open_writer_mapping();
             let ctx = ShmContext {
                 ptr: shmem.as_ptr() as *mut ShmBlock,
             };
             let block = ctx.get();
-            let previous_session = block.session_id.load(Ordering::SeqCst);
-            let writer_generation = block.writer_generation.load(Ordering::SeqCst).wrapping_add(1).max(1);
-            let writer_heartbeat = block.writer_heartbeat.load(Ordering::SeqCst).wrapping_add(1).max(1);
-
-            // 清理旧状态，确保干净的初始环境
-            block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
-            block.is_eof.store(false, Ordering::SeqCst);
-            block.reader_aborted.store(false, Ordering::SeqCst);
-            block.reader_ready.store(false, Ordering::SeqCst);
-            block.writer_ready.store(false, Ordering::SeqCst);
-            block.reader_generation.store(0, Ordering::SeqCst);
-            block.length.store(0, Ordering::SeqCst);
-
-            // 标记 Writer 已就绪
-            block.writer_generation.store(writer_generation, Ordering::SeqCst);
-            block.writer_heartbeat.store(writer_heartbeat, Ordering::SeqCst);
-            block.writer_ready.store(true, Ordering::SeqCst);
-
-            let mut current_session = previous_session.wrapping_add(1).max(1);
+            let handshake = block.reset_for_writer();
+            let mut current_session = handshake.next_session;
 
             let mut last_snapshot = collect_snapshot(path).unwrap_or_default();
 
@@ -345,13 +483,7 @@ fn main() {
             println!("👀 正在监控目录: {:?}", path);
 
             let perform_sync = |session: u32, last_snapshot: &mut HashSet<PathBuf>| {
-                // 阻塞等待 Reader 连接，避免初始同步被跳过导致死锁
-                while !block.reader_ready.load(Ordering::Acquire)
-                    || block.reader_generation.load(Ordering::Acquire) != writer_generation
-                {
-                    block.writer_heartbeat.fetch_add(1, Ordering::Release);
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+                block.wait_for_reader(handshake.generation);
 
                 let current_snapshot = match collect_snapshot(path) {
                     Ok(s) => s,
@@ -361,17 +493,16 @@ fn main() {
                     }
                 };
 
-                let mut deleted: Vec<PathBuf> = last_snapshot.difference(&current_snapshot).cloned().collect();
+                let mut deleted: Vec<PathBuf> = last_snapshot
+                    .difference(&current_snapshot)
+                    .cloned()
+                    .collect();
 
                 deleted.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
 
                 let delete_header = encode_deletions(&deleted);
 
-                block.reader_aborted.store(false, Ordering::SeqCst);
-                block.is_eof.store(false, Ordering::SeqCst);
-                block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
-                // session_id 必须最后设置，防止 Reader 看到新 session 但读到旧状态
-                block.session_id.store(session, Ordering::SeqCst);
+                block.prepare_session(session);
 
                 let writer = ShmWriterSession {
                     ctx: ctx.clone(),
@@ -397,18 +528,16 @@ fn main() {
             loop {
                 match rx.recv() {
                     Ok(Ok(_)) => {
-                        std::thread::sleep(Duration::from_millis(300));
+                        std::thread::sleep(DEBOUNCE_INTERVAL);
 
                         while rx.try_recv().is_ok() {}
 
-                        // 等待 Reader 就绪
-                        while !block.reader_ready.load(Ordering::Acquire) {
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
+                        current_session = next_nonzero(current_session);
 
-                        current_session += 1;
-
-                        println!("📝 检测到文件修改，启动自动推送 (Session {})...", current_session);
+                        println!(
+                            "📝 检测到文件修改，启动自动推送 (Session {})...",
+                            current_session
+                        );
 
                         perform_sync(current_session, &mut last_snapshot);
                     }
@@ -422,69 +551,37 @@ fn main() {
 
         Commands::SyncR => {
             println!("⏳ 等待 Writer 建立共享内存...");
-            let shmem = loop {
-                match ShmemConf::new().os_id(SHM_ID).open() {
-                    Ok(shm) => break shm,
-                    Err(e) => {
-                        eprintln!("  打开共享内存失败: {:?}, 重试中...", e);
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            };
-
+            let shmem = wait_for_writer_mapping();
             let ctx = ShmContext {
                 ptr: shmem.as_ptr() as *mut ShmBlock,
             };
             println!("🔗 已连接! 等待 Writer 就绪...");
 
-            let mut observed_heartbeat = ctx.get().writer_heartbeat.load(Ordering::Acquire);
-            let mut active_generation = 0;
-            let mut last_processed_session = 0;
+            let mut handshake = ReaderHandshake::new(ctx.get());
 
             loop {
                 let block = ctx.get();
-                let current_generation = block.writer_generation.load(Ordering::Acquire);
-                let current_heartbeat = block.writer_heartbeat.load(Ordering::Acquire);
-
-                if block.writer_ready.load(Ordering::Acquire)
-                    && current_generation != 0
-                    && current_generation != active_generation
-                    && current_heartbeat != observed_heartbeat
-                {
-                    active_generation = current_generation;
-                    last_processed_session = block.session_id.load(Ordering::Acquire);
-                    observed_heartbeat = current_heartbeat;
-                    block.reader_generation.store(active_generation, Ordering::Release);
-                    block.reader_ready.store(true, Ordering::Release);
+                if handshake.poll_writer(block) {
                     println!("✅ Writer 已就绪，开始同步!");
-                } else if current_heartbeat != observed_heartbeat {
-                    observed_heartbeat = current_heartbeat;
                 }
 
-                if active_generation == 0 {
-                    std::thread::sleep(Duration::from_millis(50));
+                if !handshake.is_connected() {
+                    std::thread::sleep(POLL_INTERVAL);
                     continue;
                 }
 
                 let current_session = block.session_id.load(Ordering::Acquire);
 
-                if current_session > last_processed_session {
+                if current_session > handshake.last_processed_session {
                     println!("📥 开始接收新版本 (Session {})...", current_session);
 
-                    let raw_reader = ShmReaderSession {
-                        ctx: ctx.clone(),
-                        session_id: current_session,
-                        current_offset: 0,
-                        current_len: 0,
-                        first_read: true,
-                        eof_reached: false,
-                    };
+                    let raw_reader = ShmReaderSession::new(ctx.clone(), current_session);
 
                     let reader = match SyncReaderSession::new(raw_reader) {
                         Ok(r) => r,
                         Err(e) => {
                             eprintln!("⚠️ 删除协议读取失败: {}", e);
-                            last_processed_session = current_session;
+                            handshake.last_processed_session = current_session;
                             continue;
                         }
                     };
@@ -495,9 +592,9 @@ fn main() {
                         Err(e) => eprintln!("⚠️ 解包发生错误: {}", e),
                     }
                     // 修复死锁：不管成功失败，绝不回退重试当前卡死的 Session
-                    last_processed_session = current_session;
+                    handshake.last_processed_session = current_session;
                 } else {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(POLL_INTERVAL);
                 }
             }
         }
