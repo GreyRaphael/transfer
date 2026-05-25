@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 
 // --- 常量配置 ---
 // 更新了 SHM_ID 防止和上次运行的死锁内存冲突
-const SHM_ID: &str = "transfer_cli_sync_v5";
+const SHM_ID: &str = "transfer_cli_sync_v6";
 const DATA_SIZE: usize = 8 * 1024 * 1024;
 const STATE_SPACE_READY: u32 = 0;
 const STATE_DATA_READY: u32 = 1;
@@ -25,6 +25,7 @@ struct ShmBlock {
     session_id: AtomicU32,
     is_eof: AtomicBool,
     reader_aborted: AtomicBool, // 新增：用于防死锁的异常中止信号
+    reader_ready: AtomicBool,   // Reader 已连接并进入主循环
     length: AtomicUsize,
     data: [u8; DATA_SIZE],
 }
@@ -36,6 +37,8 @@ struct ShmContext {
 unsafe impl Send for ShmContext {}
 
 impl ShmContext {
+    // SAFETY: ptr 指向共享内存，通过原子操作保证并发安全
+    #[allow(clippy::mut_from_ref)]
     fn get(&self) -> &mut ShmBlock {
         unsafe { &mut *self.ptr }
     }
@@ -320,6 +323,10 @@ fn main() {
             println!("👀 正在监控目录: {:?}", path);
 
             let perform_sync = |session: u32, last_snapshot: &mut HashSet<PathBuf>| {
+                if !block.reader_ready.load(Ordering::Acquire) {
+                    return;
+                }
+
                 let current_snapshot = match collect_snapshot(path) {
                     Ok(s) => s,
                     Err(e) => {
@@ -367,6 +374,11 @@ fn main() {
 
                         while rx.try_recv().is_ok() {}
 
+                        // 等待 Reader 就绪
+                        while !block.reader_ready.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+
                         current_session += 1;
 
                         println!("📝 检测到文件修改，启动自动推送 (Session {})...", current_session);
@@ -394,6 +406,7 @@ fn main() {
                 ptr: shmem.as_ptr() as *mut ShmBlock,
             };
             println!("🔗 已连接! 开启后台守护流同步...");
+            ctx.get().reader_ready.store(true, Ordering::Release);
 
             let mut last_processed_session = 0;
 
