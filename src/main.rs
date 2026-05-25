@@ -11,8 +11,8 @@ use std::time::Duration;
 use walkdir::WalkDir;
 
 // --- 常量配置 ---
-// 更新了 SHM_ID 防止和上次运行的死锁内存冲突
-const SHM_ID: &str = "transfer_cli_sync_v9";
+// 更新 SHM_ID 防止和旧布局的共享内存文件冲突
+const SHM_ID: &str = "transfer_cli_sync_v11";
 const DATA_SIZE: usize = 8 * 1024 * 1024;
 const STATE_SPACE_READY: u32 = 0;
 const STATE_DATA_READY: u32 = 1;
@@ -27,6 +27,9 @@ struct ShmBlock {
     reader_aborted: AtomicBool, // 新增：用于防死锁的异常中止信号
     reader_ready: AtomicBool,   // Reader 已连接并进入主循环
     writer_ready: AtomicBool,   // Writer 已初始化完毕
+    writer_generation: AtomicU32,
+    reader_generation: AtomicU32,
+    writer_heartbeat: AtomicU32,
     length: AtomicUsize,
     data: [u8; DATA_SIZE],
 }
@@ -313,20 +316,25 @@ fn main() {
                 ptr: shmem.as_ptr() as *mut ShmBlock,
             };
             let block = ctx.get();
+            let previous_session = block.session_id.load(Ordering::SeqCst);
+            let writer_generation = block.writer_generation.load(Ordering::SeqCst).wrapping_add(1).max(1);
+            let writer_heartbeat = block.writer_heartbeat.load(Ordering::SeqCst).wrapping_add(1).max(1);
 
             // 清理旧状态，确保干净的初始环境
             block.state.store(STATE_SPACE_READY, Ordering::SeqCst);
-            block.session_id.store(0, Ordering::SeqCst);
             block.is_eof.store(false, Ordering::SeqCst);
             block.reader_aborted.store(false, Ordering::SeqCst);
             block.reader_ready.store(false, Ordering::SeqCst);
             block.writer_ready.store(false, Ordering::SeqCst);
+            block.reader_generation.store(0, Ordering::SeqCst);
             block.length.store(0, Ordering::SeqCst);
 
             // 标记 Writer 已就绪
+            block.writer_generation.store(writer_generation, Ordering::SeqCst);
+            block.writer_heartbeat.store(writer_heartbeat, Ordering::SeqCst);
             block.writer_ready.store(true, Ordering::SeqCst);
 
-            let mut current_session = 1;
+            let mut current_session = previous_session.wrapping_add(1).max(1);
 
             let mut last_snapshot = collect_snapshot(path).unwrap_or_default();
 
@@ -338,7 +346,10 @@ fn main() {
 
             let perform_sync = |session: u32, last_snapshot: &mut HashSet<PathBuf>| {
                 // 阻塞等待 Reader 连接，避免初始同步被跳过导致死锁
-                while !block.reader_ready.load(Ordering::Acquire) {
+                while !block.reader_ready.load(Ordering::Acquire)
+                    || block.reader_generation.load(Ordering::Acquire) != writer_generation
+                {
+                    block.writer_heartbeat.fetch_add(1, Ordering::Release);
                     std::thread::sleep(Duration::from_millis(50));
                 }
 
@@ -426,18 +437,35 @@ fn main() {
             };
             println!("🔗 已连接! 等待 Writer 就绪...");
 
-            // 等待 Writer 初始化完毕
-            while !ctx.get().writer_ready.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-
-            println!("✅ Writer 已就绪，开始同步!");
-            ctx.get().reader_ready.store(true, Ordering::Release);
-
+            let mut observed_heartbeat = ctx.get().writer_heartbeat.load(Ordering::Acquire);
+            let mut active_generation = 0;
             let mut last_processed_session = 0;
 
             loop {
                 let block = ctx.get();
+                let current_generation = block.writer_generation.load(Ordering::Acquire);
+                let current_heartbeat = block.writer_heartbeat.load(Ordering::Acquire);
+
+                if block.writer_ready.load(Ordering::Acquire)
+                    && current_generation != 0
+                    && current_generation != active_generation
+                    && current_heartbeat != observed_heartbeat
+                {
+                    active_generation = current_generation;
+                    last_processed_session = block.session_id.load(Ordering::Acquire);
+                    observed_heartbeat = current_heartbeat;
+                    block.reader_generation.store(active_generation, Ordering::Release);
+                    block.reader_ready.store(true, Ordering::Release);
+                    println!("✅ Writer 已就绪，开始同步!");
+                } else if current_heartbeat != observed_heartbeat {
+                    observed_heartbeat = current_heartbeat;
+                }
+
+                if active_generation == 0 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+
                 let current_session = block.session_id.load(Ordering::Acquire);
 
                 if current_session > last_processed_session {
